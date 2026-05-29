@@ -1,5 +1,8 @@
 # SQL Server Performance Tuning: A Practical SOP for Bottleneck Analysis (2016–2025)
 
+https://github.com/PMSQLDBA/SQL-Server-DB-Performance-Tuning/blob/main/SQL%20Server%20Performance%20Tuning%20SOP.pdf
+
+
 > **Scope:** SQL Server 2016 through SQL Server 2025 (on-premises and Azure SQL Managed Instance)
 > **Audience:** DBAs, Platform Engineers, and Backend Developers responsible for production SQL Server environments
 > **Purpose:** Step-by-step Standard Operating Procedure (SOP) for diagnosing and resolving performance bottlenecks systematically — not reactively
