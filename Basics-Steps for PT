@@ -283,14 +283,13 @@ ORDER BY mg.granted_memory_kb DESC;
 SELECT TOP 10
     qt.query_sql_text,
     rs.avg_num_physical_io_reads,
-    rs.avg_spills,                  -- SQL Server 2017+
     rs.count_executions,
     p.plan_id
 FROM sys.query_store_query_text qt
 JOIN sys.query_store_query q   ON qt.query_text_id = q.query_text_id
 JOIN sys.query_store_plan p    ON q.query_id = p.query_id
 JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
-ORDER BY rs.avg_spills DESC;        -- Focus on highest-spill queries
+ORDER BY rs.avg_num_physical_io_reads DESC; -- Focus on highest physical reads
 
 -- PLE (Page Life Expectancy) -- healthy > 300 seconds (higher on large servers)
 SELECT object_name, counter_name, cntr_value
@@ -312,7 +311,8 @@ EXEC sp_configure 'max server memory (MB)', 28672;  -- example: 28 GB on 32 GB s
 RECONFIGURE;
 
 -- Check cardinality estimator version in use
-SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME();
+SELECT compatibility_level FROM sys.databases 
+WHERE name = DB_NAME();
 -- Level 130 = SQL 2016 CE; Level 140 = 2017; Level 150 = 2019; Level 160 = 2022
 -----
 
@@ -358,7 +358,9 @@ SELECT
 FROM sys.dm_exec_sessions s
 JOIN sys.dm_tran_session_transactions tst ON s.session_id = tst.session_id
 JOIN sys.dm_tran_active_transactions t    ON tst.transaction_id = t.transaction_id
-OUTER APPLY sys.dm_exec_sql_text(s.most_recent_sql_handle) st
+-- Join to connections to get the most recent SQL handle for older SQL versions
+LEFT JOIN sys.dm_exec_connections c       ON s.session_id = c.session_id
+OUTER APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) st
 WHERE t.transaction_type = 1  -- Read-Write
 ORDER BY txn_age_sec DESC;
 
@@ -512,7 +514,8 @@ SELECT
     wait_type,
     waiting_tasks_count,
     wait_time_ms,
-    wait_resource
+    max_wait_time_ms,
+    (wait_time_ms - signal_wait_time_ms) AS resource_wait_time_ms
 FROM sys.dm_os_wait_stats
 WHERE wait_type LIKE 'PAGELATCH%'
 ORDER BY wait_time_ms DESC;
@@ -548,9 +551,11 @@ ALTER SERVER CONFIGURATION SET TEMPDB METADATA MEMORY_OPTIMIZED = ON;
 
 ### Scenario 8 — Query Regression After SQL Server Upgrade / Compatibility Level Change
 
-**Real-world case:** *After upgrading from SQL Server 2014 (compat level 120) to SQL Server 2019 (compat level 150), 15 queries regressed. The team is considering rolling back.*
+**Real-world case:** *After upgrading from SQL Server 2014 (compat level 120) to SQL Server 2019 (compat level 150), 15 queries regressed. 
+The team is considering rolling back.*
 
-**Root cause:** The new Cardinality Estimator (CE) model introduced in SQL Server 2014 (CE70 → CE120 → CE150 → CE160) can produce better or worse estimates depending on data distribution. Regression is common when moving across CE generations.
+**Root cause:** The new Cardinality Estimator (CE) model introduced in SQL Server 2014 (CE70 → CE120 → CE150 → CE160) can produce better or worse estimates depending on data distribution. 
+Regression is common when moving across CE generations.
 
 **Strategy: Use Query Store to identify and fix regressions without rollback.**
 
@@ -609,7 +614,9 @@ EXEC sys.sp_query_store_force_plan
 SELECT
     scheduler_count,
     max_workers_count,
-    active_workers_count,
+    -- Subquery to pull the count of currently active workers
+    (SELECT COUNT(*) FROM sys.dm_os_workers WHERE state = 'RUNNING' OR is_preemptive = 1) AS active_workers_count,
+    -- Your original subquery for pending tasks
     (SELECT COUNT(*) FROM sys.dm_os_tasks WHERE task_state = 'PENDING') AS pending_tasks
 FROM sys.dm_os_sys_info;
 
@@ -693,12 +700,14 @@ SELECT
     qt.query_sql_text,
     q.query_id,
     p.plan_id,
-    p.is_feedback_adjusted,        -- 1 = plan was adjusted by feedback
-    p.is_memory_grant_feedback_adjusted
+    pf.feature_desc,
+    pf.feedback_data,
+    pf.state_desc         -- Changed from feedback_state_desc
 FROM sys.query_store_plan p
 JOIN sys.query_store_query q   ON p.query_id = q.query_id
 JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
-WHERE p.is_feedback_adjusted = 1;
+JOIN sys.query_store_plan_feedback pf ON p.plan_id = pf.plan_id
+WHERE pf.state_desc = 'ADJUSTED';  -- Changed from feedback_state_desc
 
 ### PSP Optimization (SQL Server 2022+)
 
@@ -708,9 +717,9 @@ A single stored procedure can now serve a range of parameter inputs with appropr
 -- Verify PSP is in use for a query (look for dispatcher plan)
 SELECT
     qt.query_sql_text,
+    q.query_id,
     p.plan_id,
     p.query_plan_hash,
-    p.is_parameterizable,
     p.plan_forcing_type_desc
 FROM sys.query_store_plan p
 JOIN sys.query_store_query q   ON p.query_id = q.query_id
@@ -884,7 +893,6 @@ EXEC sys.sp_query_store_flush_db;
 
 ### Query Store on Secondary Replicas (SQL Server 2022+)
 
-```sql
 -- Enable QS for readable secondaries (AG environments)
 ALTER DATABASE [YourDatabase]
 SET QUERY_STORE = ON (QUERY_CAPTURE_MODE = AUTO, READ_WRITE_MODE = READ_WRITE);
